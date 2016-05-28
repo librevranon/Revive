@@ -6,6 +6,12 @@
 #include "REV_Assert.h"
 #include "REV_Common.h"
 
+#include "MirrorVS.hlsl.h"
+#include "MirrorPS.hlsl.h"
+
+ID3D11VertexShader* g_pMirrorVS = nullptr;
+ID3D11PixelShader* g_pMirrorPS = nullptr;
+
 DXGI_FORMAT ovr_TextureFormatToDXGIFormat(ovrTextureFormat format, unsigned int flags)
 {
 	if (flags & ovrTextureMisc_DX_Typeless)
@@ -71,6 +77,12 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_CreateTextureSwapChainDX(ovrSession session,
                                                             const ovrTextureSwapChainDesc* desc,
                                                             ovrTextureSwapChain* out_TextureSwapChain)
 {
+	if (!session)
+		return ovrError_InvalidSession;
+
+	if (!d3dPtr || !desc || !out_TextureSwapChain || desc->Type != ovrTexture_2D)
+		return ovrError_InvalidParameter;
+
 	// TODO: DX12 support.
 	ID3D11Device* pDevice;
 	HRESULT hr = d3dPtr->QueryInterface(&pDevice);
@@ -97,11 +109,14 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_CreateTextureSwapChainDX(ovrSession session,
 
 	for (int i = 0; i < swapChain->length; i++)
 	{
+		ID3D11Texture2D* texture;
 		swapChain->texture[i].eType = vr::API_DirectX;
 		swapChain->texture[i].eColorSpace = vr::ColorSpace_Auto; // TODO: Set this from the texture format.
-		hr = pDevice->CreateTexture2D(&tdesc, nullptr, (ID3D11Texture2D**)&swapChain->texture[i].handle);
+		hr = pDevice->CreateTexture2D(&tdesc, nullptr, &texture);
 		if (FAILED(hr))
 			return ovrError_RuntimeException;
+
+		swapChain->texture[i].handle = texture;
 	}
 	swapChain->current = swapChain->texture[swapChain->index];
 
@@ -117,10 +132,16 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_GetTextureSwapChainBufferDX(ovrSession sessio
                                                                IID iid,
                                                                void** out_Buffer)
 {
+	if (!session)
+		return ovrError_InvalidSession;
+
+	if (!chain || !out_Buffer)
+		return ovrError_InvalidParameter;
+
 	ID3D11Texture2D* texturePtr = (ID3D11Texture2D*)chain->texture[index].handle;
 	HRESULT hr = texturePtr->QueryInterface(iid, out_Buffer);
 	if (FAILED(hr))
-		return ovrError_RuntimeException;
+		return ovrError_InvalidParameter;
 
 	return ovrSuccess;
 }
@@ -130,6 +151,12 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_CreateMirrorTextureDX(ovrSession session,
                                                          const ovrMirrorTextureDesc* desc,
                                                          ovrMirrorTexture* out_MirrorTexture)
 {
+	if (!session)
+		return ovrError_InvalidSession;
+
+	if (!d3dPtr || !desc || !out_MirrorTexture)
+		return ovrError_InvalidParameter;
+
 	// TODO: DX12 support.
 	ID3D11Device* pDevice;
 	HRESULT hr = d3dPtr->QueryInterface(&pDevice);
@@ -154,12 +181,16 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_CreateMirrorTextureDX(ovrSession session,
 	if (FAILED(hr))
 		return ovrError_RuntimeException;
 
-	// TODO: Should add multiple buffers to swapchain?
 	ovrMirrorTexture mirrorTexture = new ovrMirrorTextureData();
 	mirrorTexture->desc = *desc;
 	mirrorTexture->texture.handle = texture;
 	mirrorTexture->texture.eType = vr::API_DirectX;
 	mirrorTexture->texture.eColorSpace = vr::ColorSpace_Auto; // TODO: Set this from the texture format.
+
+	// Create a render target for the mirror texture.
+	pDevice->CreateRenderTargetView(texture, NULL, (ID3D11RenderTargetView**)&mirrorTexture->target);
+	if (FAILED(hr))
+		return ovrError_RuntimeException;
 
 	// Clean up and return
 	pDevice->Release();
@@ -172,6 +203,12 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_GetMirrorTextureBufferDX(ovrSession session,
                                                             IID iid,
                                                             void** out_Buffer)
 {
+	if (!session)
+		return ovrError_InvalidSession;
+
+	if (!mirrorTexture || !out_Buffer)
+		return ovrError_InvalidParameter;
+
 	ID3D11Texture2D* texture = (ID3D11Texture2D*)mirrorTexture->texture.handle;
 
 	ID3D11Device* pDevice;
@@ -179,23 +216,45 @@ OVR_PUBLIC_FUNCTION(ovrResult) ovr_GetMirrorTextureBufferDX(ovrSession session,
 	ID3D11DeviceContext* pContext;
 	pDevice->GetImmediateContext(&pContext);
 
-	int perEyeWidth = mirrorTexture->desc.Width / 2;
-	for (int i = 0; i < ovrEye_Count; i++)
+	// Compile and set vertex shader
+	if (!g_pMirrorVS)
 	{
-		ovrTextureSwapChain chain = session->ColorTexture[i];
-		if (chain)
-		{
-			// TODO: Support texture bounds.
-			ID3D11Texture2D* eyeTexture = (ID3D11Texture2D*)chain->current.handle;
-			pContext->CopySubresourceRegion(texture, 0, perEyeWidth * i, 0, 0, eyeTexture, 0, nullptr);
-		}
+		HRESULT hr = pDevice->CreateVertexShader(g_MirrorVS, sizeof(g_MirrorVS), NULL, &g_pMirrorVS);
+		if (FAILED(hr))
+			return ovrError_RuntimeException;
 	}
+	pContext->VSSetShader(g_pMirrorVS, NULL, 0);
+
+	// Compile and set pixel shader
+	if (!g_pMirrorPS)
+	{
+		HRESULT hr = pDevice->CreatePixelShader(g_MirrorPS, sizeof(g_MirrorPS), NULL, &g_pMirrorPS);
+		if (FAILED(hr))
+			return ovrError_RuntimeException;
+	}
+	pContext->PSSetShader(g_pMirrorPS, NULL, 0);
+
+	ID3D11ShaderResourceView* mirrorViews[2];
+	session->compositor->GetMirrorTextureD3D11(vr::Eye_Left, pDevice, (void**)&mirrorViews[0]);
+	session->compositor->GetMirrorTextureD3D11(vr::Eye_Right, pDevice, (void**)&mirrorViews[1]);
+	pContext->PSSetShaderResources(0, 2, mirrorViews);
+
+	// Draw a triangle strip, the vertex buffer is not used.
+	FLOAT clear[4] = { 0.0f };
+	D3D11_VIEWPORT viewport = { 0.0f, 0.0f, mirrorTexture->desc.Width, mirrorTexture->desc.Height, D3D11_MIN_DEPTH, D3D11_MIN_DEPTH };
+	pContext->RSSetViewports(1, &viewport);
+	pContext->ClearRenderTargetView((ID3D11RenderTargetView*)mirrorTexture->target, clear);
+	pContext->OMSetRenderTargets(1, (ID3D11RenderTargetView**)&mirrorTexture->target, NULL);
+	pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	pContext->Draw(4, 0);
 
 	HRESULT hr = texture->QueryInterface(iid, out_Buffer);
 	if (FAILED(hr))
-		return ovrError_RuntimeException;
+		return ovrError_InvalidParameter;
 
 	// Clean up and return
+	mirrorViews[0]->Release();
+	mirrorViews[1]->Release();
 	pDevice->Release();
 	pContext->Release();
 	return ovrSuccess;
